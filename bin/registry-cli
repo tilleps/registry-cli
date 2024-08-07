@@ -1,0 +1,258 @@
+#!/usr/bin/env sh
+
+# Created for bash 3.2 which does not support associative arrays
+
+# References
+# https://gist.github.com/jaytaylor/86d5efaddda926a25fa68c263830dac1
+#
+
+readonly VER=0.1.0
+DELETE_ENABLED=0
+
+# Remove the longest `*/` prefix
+readonly SCRIPT_FULL_NAME="${0##*/}"
+
+
+# exit when any command fails
+set -e
+
+
+
+usage() {
+  cat <<HEREDOC
+NAME
+
+    $SCRIPT_FULL_NAME -- remove older image(s) from a private Docker Registry
+
+SYNOPSIS
+
+    $SCRIPT_FULL_NAME [-d] registry_url image_name limit [username] [password]
+    $SCRIPT_FULL_NAME -h: display this help
+
+DESCRIPTION
+
+    Removes the tagged image(s) from the local Docker Registry.
+
+    The following options are available:
+
+    registry_url  The domain/host of the registry, include the protocol (https/http), exclude the path (/v2/*)
+    image_name    The image you want to delete
+    limit         The number of tags you want to keep for a specific image, set to 0 to delete all, -1 to keep all
+    username      [OPTIONAL] The username to connect to the Docker registry
+    password      [OPTIONAL] The password to connect to the Docker registry
+
+    -d enable_delete [OPTIONAL] Enables delete mode is enabled
+
+EXAMPLES
+
+    $ $SCRIPT_FULL_NAME https://registry.example.local app 5 username password
+
+v$VER
+HEREDOC
+  exit 1
+}
+
+
+# If a character is followed by a colon, the option is expected to have an argument
+while getopts dr:c:u:h OPT; do
+  case "$OPT" in
+    d)
+      readonly DELETE_ENABLED=1
+      ;;
+    *) # -h or `?`: an unknown option
+      usage
+      ;;
+  esac
+done
+
+# Shift the options so that $1 now refers to the first non-option argument
+shift $((OPTIND - 1))
+
+
+#
+#  Show help message if incorrect number of arguments
+#
+if [ "$#" -le 4 ]; then
+  usage
+fi
+
+
+#
+#  Define variables
+#
+REGISTRY_URL=${1}
+IMAGE=${2}
+LIMIT=${3}
+USERNAME=${4}
+PASSWORD=${5}
+
+
+#
+#  Get the Creation date of image
+#
+function get_creation_date() {
+  local tag=$1
+  local creation_date=$(curl --silent --user "${USERNAME}:${PASSWORD}" "${REGISTRY_URL}/v2/${IMAGE}/manifests/${tag}")
+
+  echo ${creation_date} | grep -Eo '"created\\":\\".*?\\"' | head -1 | sed 's/\\"//g' | sed 's/"created://g'
+}
+
+
+#
+#  Get the Docker-Content-Digest header value
+#
+function get_image_digest() {
+  local tag=$1
+  local manifest=$(curl --silent --head --show-error --header "Accept: application/vnd.docker.distribution.manifest.v2+json" --user "${USERNAME}:${PASSWORD}" "${REGISTRY_URL}/v2/${IMAGE}/manifests/${tag}")
+
+  echo "${manifest}" | awk '$1 == "Docker-Content-Digest:" { print $2 }' | tr -d $'\r'
+}
+
+
+#
+#  Delete tag image
+#
+function delete_tag_image() {
+  local image=$1
+  local image_digest=$2
+  
+  echo 2022
+  return
+
+  local response_code=$(curl --request DELETE --silent --show-error -o /dev/null -w "%{http_code}" --user "${USERNAME}:${PASSWORD}" "${REGISTRY_URL}/v2/${image}/manifests/${image_digest}")
+
+  echo ${response_code}
+}
+
+
+#
+#  Get list of tags
+#
+tags_list=$(curl --silent --user ${USERNAME}:${PASSWORD} "${REGISTRY_URL}/v2/${IMAGE}/tags/list" | grep -Eo '"tags":\[.*?[^\\]\]' | awk -F':' '{print $2}')
+
+
+# Remove leading and trailing square brackets and split by comma into an array
+IFS=',' read -r -a tags <<< "${tags_list//[\"\[\]]}"
+
+# Loop through tags and fetch creation date for each
+declare -a tag_dates
+declare -a tag_names
+
+declare -a image_identifiers
+
+
+# Loop through each tag
+for (( i=0; i<${#tags[@]}; i++ )); do
+  tag=${tags[$i]}
+
+  tag_date=$(get_creation_date ${tag})
+  tag_dates[$i]=${tag_date}
+
+  tag_names[$i]=${tag}
+
+  image_identifier="${tag_date}#${tag}"
+  image_identifiers[$i]=${image_identifier}
+done
+
+#
+#  Sort the tags by creation date
+#
+sorted_identifiers=($(printf '%s\n' "${image_identifiers[@]}" | sort -r))
+
+
+#
+#  List tags
+#
+echo "List of tags"
+echo "--------------"
+
+
+#
+#  Identify the identifiers to delete
+#
+declare -a identifiers_to_delete
+
+for (( i=0; i<${#sorted_identifiers[@]}; i++ )); do
+
+  sorted_identifier=${sorted_identifiers[$i]}
+
+  #
+  #  Determine if the image exceeds the keep limit
+  #
+  j=($i + 1);
+
+  if [[ $LIMIT -lt 0 || $j -lt $LIMIT ]]; then
+    echo "KEEP   " ${sorted_identifier}
+    continue
+  fi
+
+  echo "DELETE " ${sorted_identifier}
+
+  identifiers_to_delete[${#identifiers_to_delete[@]}]=${sorted_identifier}
+
+done
+
+
+#
+#  Create a list of tags to delete
+#
+declare -a tags_to_delete
+for (( i=0; i<${#identifiers_to_delete[@]}; i++ )); do
+
+  identifier_to_delete=${identifiers_to_delete[$i]}
+
+  for (( k=0; k<${#image_identifiers[@]}; k++ )); do
+    image_identifier=${image_identifiers[$k]}
+
+    # Find the matching index and add to the list of tags to delete
+    if [ ${identifier_to_delete} == ${image_identifier} ]; then
+      image_to_delete=${tags[$k]}
+      tags_to_delete[${#tags_to_delete[@]}]=${image_to_delete}
+    fi
+  done
+
+done
+
+
+#
+#  Tags to Delete
+#  Need to get the manifests for each
+#
+echo ""
+printf "Tags to delete"
+
+if [ "${DELETE_ENABLED}" -ne 1 ]; then
+  echo " (NOT enabled)"
+fi
+
+echo "--------------"
+
+
+for (( i=0; i<${#tags_to_delete[@]}; i++ )); do
+  tag_to_delete=${tags_to_delete[$i]}
+
+  # Print without newline
+  printf "${IMAGE}:${tag_to_delete}"
+  
+  if [ "${DELETE_ENABLED}" -ne 1 ]; then
+    echo "  SKIPPED"
+    continue
+  fi
+
+
+  # Get the image digest
+  image_digest=$(get_image_digest ${tag_to_delete})
+
+  # Delete the image
+  response_code=$(delete_tag_image ${IMAGE} ${image_digest})
+
+  if [ "${response_code}" -eq 202 ]; then
+    # Successful image deletion
+    echo "  DELETED"
+  else
+    # Issue with deleting image
+    echo "  ERROR ${response_code}"
+  fi
+
+done
+
